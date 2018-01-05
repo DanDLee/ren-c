@@ -50,6 +50,8 @@
 #define MAX_HISTORY  300    // number of lines stored
 
 
+#define CHAR_LEN(c) (1 + trailingBytesForUTF8[c])
+
 #define WRITE_CHAR(s) \
     do { \
         if (write(1, s, 1) == -1) { \
@@ -71,6 +73,17 @@
         } \
     } while (0)
 
+//
+// Stepping backwards in UTF8 just means to keep going back so long
+// as you are looking at a byte with bit 7 set and bit 6 clear:
+//
+// https://stackoverflow.com/a/22257843/211160
+//
+#define STEP_BACKWARD(term) \
+    do { \
+        --term->pos; \
+    } while ((term->buffer[term->pos] & 0xC0) == 0x80); 
+
 typedef struct term_data {
     REBYTE *buffer;
     REBYTE *residue;
@@ -82,7 +95,7 @@ typedef struct term_data {
 
 // Globals:
 static REBOOL Term_Initialized = FALSE;     // Terminal init was successful
-static REBYTE **Line_History;                 // Prior input lines
+static REBYTE **Line_History;               // Prior input lines
 static int Line_Count;                      // Number of prior lines
 
 #ifndef NO_TTY_ATTRIBUTES
@@ -315,12 +328,14 @@ static void Clear_Line(STD_TERM *term)
 //  Home_Line: C
 //
 // Reset cursor to home position.
-// Unicode: not used
+// Unicode: ok
 //
 static void Home_Line(STD_TERM *term)
 {
-    Write_Char(BS, term->pos);
-    term->pos = 0;
+    while (term->pos > 0) {
+        STEP_BACKWARD(term);
+        Write_Char(BS, 1);
+    }
 }
 
 
@@ -340,6 +355,21 @@ static void End_Line(STD_TERM *term)
     }
 }
 
+//
+//  Strlen_UTF8: C
+//
+//  Count the character length (not byte length) of a UTF-8 string.
+//  !!! Used to calculate the correct number of BS to us in Show_Line().
+//      Would stepping through the UTF-8 string be better?
+//
+static const int Strlen_UTF8(REBYTE *buffer, int byte_count) {
+	int char_count = 0;
+	for(int i = 0 ; i < byte_count ; i++) 
+	    if ((buffer[i] & 0xC0) != 0x80) 
+		    char_count++;
+
+	return char_count;
+}
 
 //
 //  Show_Line: C
@@ -353,8 +383,7 @@ static void End_Line(STD_TERM *term)
 static void Show_Line(STD_TERM *term, int blanks)
 {
     int len;
-
-    //printf("\r\nsho pos: %d end: %d ==", term->pos, term->end);
+    //printf("\r\nsho pos: %d end: %d blanks: %d ==\r\n", term->pos, term->end, blanks);
 
     // Clip bounds:
     if (term->pos < 0) term->pos = 0;
@@ -371,7 +400,10 @@ static void Show_Line(STD_TERM *term, int blanks)
     }
 
     Write_Char(' ', blanks);
-    Write_Char(BS, blanks + len); // return to position or end
+
+    // return to original position or end
+    Write_Char(BS,  blanks);
+    Write_Char(BS,  Strlen_UTF8(term->buffer+term->pos, len));
 }
 
 
@@ -392,7 +424,6 @@ static const char trailingBytesForUTF8[256] = {
     1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
     2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2, 3,3,3,3,3,3,3,3,4,4,4,4,5,5,5,5
 };
-
 
 //
 //  Insert_Char_Null_If_Interrupted: C
@@ -452,25 +483,20 @@ static const REBYTE *Insert_Char_Null_If_Interrupted(
 //
 // Delete a char at the current position. Adjust end position.
 // Redisplay the line. Blank out extra char at end.
-// Unicode: not yet supported!
+// Unicode: ok
 //
 static void Delete_Char(STD_TERM *term, REBOOL back)
 {
     if (term->pos == term->end && NOT(back))
         return; //Ctrl-D at EOL
 
+    //printf("Before-> Head: %c, Pos: %i, End: %i\n", term->buffer[term->pos], term->pos, term->end);
     if (back) {
-        //
-        // Stepping backwards in UTF8 just means to keep going back so long
-        // as you are looking at a byte with bit 7 set and bit 6 clear:
-        //
-        // https://stackoverflow.com/a/22257843/211160
-        //
-        do {
-            --term->pos;
-        } while ((term->buffer[term->pos] & 0xC0) == 0x80);
+	STEP_BACKWARD(term);
+	Write_Char(BS, 1);
     }
 
+    //printf("Mid-> Head: %c, Pos: %i, End: %i\n", term->buffer[term->pos], term->pos, term->end);
     int encoded_len = 1 + trailingBytesForUTF8[term->buffer[term->pos]];
     int len = encoded_len + term->end - term->pos;
 
@@ -480,10 +506,11 @@ static void Delete_Char(STD_TERM *term, REBOOL back)
             term->buffer + term->pos + encoded_len,
             len
         );
-        if (back)
-            Write_Char(BS, 1);
+        //if (back)
+        //    Write_Char(BS, 1);
 
         term->end -= encoded_len;
+	//printf("After-> Head: %c, Pos: %i, End: %i\n", term->buffer[term->pos], term->pos, term->end);
         Show_Line(term, 1);
     }
     else
@@ -501,14 +528,15 @@ static void Move_Cursor(STD_TERM *term, int count)
 {
     if (count < 0) {
         if (term->pos > 0) {
-            term->pos--;
+            STEP_BACKWARD(term);
             Write_Char(BS, 1);
         }
     }
     else {
         if (term->pos < term->end) {
-            WRITE_CHAR(term->buffer + term->pos);
-            term->pos++;
+            int encoded_len = CHAR_LEN(term->buffer[term->pos]);
+            WRITE_CHARS(term->buffer + term->pos, encoded_len);  // !!! tighten up
+	    term->pos += encoded_len;
         }
     }
 }
@@ -663,7 +691,7 @@ restart:;
             // https://github.com/antirez/linenoise
 
             cp += 2; // skip ESC and '['
-
+//printf("\r\nESC: %c \r\n", *cp);
             switch (*cp) {
 
             case 'A': // up arrow (VT100)
