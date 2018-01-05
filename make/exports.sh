@@ -1,0 +1,10 @@
+export CONFIG=generic.r
+export OS_ID=0.2.40
+export DEBUG=asserts
+export STANDARD=c99
+export RIGOROUS=no
+export STATIC=no
+export FFI="dynamic"
+export ODBC_REQUIRES_LTDL="no"
+export CC=gcc
+gcc --version
